@@ -1,11 +1,11 @@
 """
-MemvidRetriever - Fast semantic search, QR frame extraction, and context assembly
+MemvidRetriever - Fast semantic search, BM25, hybrid search, QR frame extraction, and context assembly
 """
 
 import json
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Literal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from functools import lru_cache
@@ -22,7 +22,14 @@ logger = logging.getLogger(__name__)
 
 
 class MemvidRetriever:
-    """Fast retrieval from QR code videos using semantic search"""
+    """
+    Fast retrieval from QR code videos using semantic search, BM25, or hybrid search.
+    
+    Supports three search modes:
+    - 'vector': Semantic search using embeddings (default)
+    - 'bm25': Keyword-based search for exact matching
+    - 'hybrid': Combines both using Reciprocal Rank Fusion (RRF)
+    """
     
     def __init__(self, video_file: str, index_file: str, 
                  config: Optional[Dict[str, Any]] = None):
@@ -49,7 +56,10 @@ class MemvidRetriever:
         # Verify video file
         self._verify_video()
         
-        logger.info(f"Initialized retriever with {self.index_manager.get_stats()['total_chunks']} chunks")
+        # Log available search modes
+        stats = self.index_manager.get_stats()
+        logger.info(f"Initialized retriever with {stats['total_chunks']} chunks")
+        logger.info(f"Available search modes: {stats.get('search_modes_available', ['vector'])}")
     
     def _verify_video(self):
         """Verify video file is accessible"""
@@ -63,21 +73,40 @@ class MemvidRetriever:
         
         logger.info(f"Video has {self.total_frames} frames at {self.fps} fps")
     
-    def search(self, query: str, top_k: int = 5) -> List[str]:
+    def search(
+        self, 
+        query: str, 
+        top_k: int = 5,
+        mode: Literal["vector", "bm25", "hybrid"] = "vector"
+    ) -> List[str]:
         """
-        Search for relevant chunks using semantic search
+        Search for relevant chunks.
         
         Args:
             query: Search query
             top_k: Number of results to return
+            mode: Search mode
+                - 'vector': Semantic search using embeddings (default)
+                - 'bm25': Keyword-based search for exact matching
+                - 'hybrid': Combines both using RRF fusion
             
         Returns:
             List of relevant text chunks
+            
+        Example:
+            # Semantic search (default, original behavior)
+            results = retriever.search("machine learning concepts")
+            
+            # Exact keyword matching (good for technical terms)
+            results = retriever.search("ISO 27001", mode="bm25")
+            
+            # Best of both worlds
+            results = retriever.search("security compliance", mode="hybrid")
         """
         start_time = time.time()
         
-        # Semantic search in index
-        search_results = self.index_manager.search(query, top_k)
+        # Search in index with specified mode
+        search_results = self.index_manager.search(query, top_k, mode=mode)
         
         # Extract unique frame numbers
         frame_numbers = list(set(result[2]["frame"] for result in search_results))
@@ -87,7 +116,7 @@ class MemvidRetriever:
         
         # Extract text from decoded data
         results = []
-        for chunk_id, distance, metadata in search_results:
+        for chunk_id, score, metadata in search_results:
             frame_num = metadata["frame"]
             if frame_num in decoded_frames:
                 try:
@@ -101,7 +130,7 @@ class MemvidRetriever:
                 results.append(metadata["text"])
         
         elapsed = time.time() - start_time
-        logger.info(f"Search completed in {elapsed:.3f}s for query: '{query[:50]}...'")
+        logger.info(f"Search ({mode}) completed in {elapsed:.3f}s for query: '{query[:50]}...'")
         
         return results
     
@@ -182,21 +211,27 @@ class MemvidRetriever:
         
         return results
     
-    def search_with_metadata(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search_with_metadata(
+        self, 
+        query: str, 
+        top_k: int = 5,
+        mode: Literal["vector", "bm25", "hybrid"] = "vector"
+    ) -> List[Dict[str, Any]]:
         """
-        Search with full metadata
+        Search with full metadata.
         
         Args:
             query: Search query
             top_k: Number of results
+            mode: Search mode ('vector', 'bm25', or 'hybrid')
             
         Returns:
             List of result dictionaries with text, score, and metadata
         """
         start_time = time.time()
         
-        # Semantic search
-        search_results = self.index_manager.search(query, top_k)
+        # Search with specified mode
+        search_results = self.index_manager.search(query, top_k, mode=mode)
         
         # Extract frame numbers
         frame_numbers = list(set(result[2]["frame"] for result in search_results))
@@ -206,7 +241,7 @@ class MemvidRetriever:
         
         # Build results with metadata
         results = []
-        for chunk_id, distance, metadata in search_results:
+        for chunk_id, score, metadata in search_results:
             frame_num = metadata["frame"]
             
             # Get text from decoded frame or metadata
@@ -221,14 +256,15 @@ class MemvidRetriever:
             
             results.append({
                 "text": text,
-                "score": 1.0 / (1.0 + distance),  # Convert distance to similarity score
+                "score": score,
                 "chunk_id": chunk_id,
                 "frame": frame_num,
-                "metadata": metadata
+                "metadata": metadata,
+                "search_mode": mode
             })
         
         elapsed = time.time() - start_time
-        logger.info(f"Search with metadata completed in {elapsed:.3f}s")
+        logger.info(f"Search with metadata ({mode}) completed in {elapsed:.3f}s")
         
         return results
     
@@ -277,11 +313,22 @@ class MemvidRetriever:
     
     def get_stats(self) -> Dict[str, Any]:
         """Get retriever statistics"""
+        index_stats = self.index_manager.get_stats()
         return {
             "video_file": self.video_file,
             "total_frames": self.total_frames,
             "fps": self.fps,
             "cache_size": len(self._frame_cache),
             "max_cache_size": self._cache_size,
-            "index_stats": self.index_manager.get_stats()
+            "index_stats": index_stats,
+            "search_modes_available": index_stats.get("search_modes_available", ["vector"])
         }
+    
+    def get_available_search_modes(self) -> List[str]:
+        """
+        Get list of available search modes.
+        
+        Returns:
+            List of available modes (e.g., ['vector', 'bm25', 'hybrid'])
+        """
+        return self.index_manager.get_stats().get("search_modes_available", ["vector"])
