@@ -1,12 +1,15 @@
 """
-Index management for embeddings and vector search
+Index management for embeddings, BM25, and hybrid search
+
+Enhanced with BM25 support and Reciprocal Rank Fusion (RRF) for hybrid retrieval.
+Based on 2025 research showing hybrid search outperforms single-method approaches.
 """
 
 import json
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Literal
 import logging
 from pathlib import Path
 import pickle
@@ -16,9 +19,27 @@ from .config import get_default_config
 
 logger = logging.getLogger(__name__)
 
+# Optional BM25 support
+try:
+    from rank_bm25 import BM25Okapi
+    BM25_AVAILABLE = True
+except ImportError:
+    BM25_AVAILABLE = False
+    logger.info("rank_bm25 not installed. BM25 search disabled. Install with: pip install rank-bm25")
+
 
 class IndexManager:
-    """Manages embeddings, FAISS index, and metadata for fast retrieval"""
+    """
+    Manages embeddings, FAISS index, BM25 index, and metadata for fast retrieval.
+    
+    Supports three search modes:
+    - 'vector': Semantic search using FAISS (default, original behavior)
+    - 'bm25': Keyword-based search using BM25 (exact matching)
+    - 'hybrid': Combines vector and BM25 using Reciprocal Rank Fusion (RRF)
+    
+    Research shows hybrid search typically outperforms single-method approaches,
+    especially for technical documentation and precise terminology matching.
+    """
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         """
@@ -33,6 +54,11 @@ class IndexManager:
         
         # Initialize FAISS index
         self.index = self._create_index()
+        
+        # Initialize BM25 index (if available)
+        self.bm25_index = None
+        self.tokenized_corpus = []
+        self.bm25_enabled = BM25_AVAILABLE
         
         # Metadata storage
         self.metadata = []
@@ -56,6 +82,36 @@ class IndexManager:
         # Add ID mapping for retrieval
         index = faiss.IndexIDMap(index)
         return index
+    
+    def _tokenize(self, text: str) -> List[str]:
+        """
+        Tokenize text for BM25 indexing.
+        Simple whitespace tokenization with lowercasing.
+        
+        Args:
+            text: Text to tokenize
+            
+        Returns:
+            List of tokens
+        """
+        # Simple tokenization - can be enhanced with nltk or spacy
+        return text.lower().split()
+    
+    def _build_bm25_index(self, chunks: List[str]):
+        """
+        Build BM25 index from chunks
+        
+        Args:
+            chunks: List of text chunks
+        """
+        if not BM25_AVAILABLE:
+            logger.warning("BM25 not available. Install with: pip install rank-bm25")
+            return
+        
+        logger.info(f"Building BM25 index for {len(chunks)} chunks...")
+        self.tokenized_corpus = [self._tokenize(chunk) for chunk in chunks]
+        self.bm25_index = BM25Okapi(self.tokenized_corpus)
+        logger.info("BM25 index built successfully")
 
     def add_chunks(self, chunks: List[str], frame_numbers: List[int],
                    show_progress: bool = True) -> List[int]:
@@ -112,10 +168,21 @@ class IndexManager:
         try:
             chunk_ids = self._add_to_index(embeddings, valid_chunks, valid_frames)
             logger.info(f"Successfully added {len(chunk_ids)} chunks to index")
-            return chunk_ids
         except Exception as e:
             logger.error(f"Failed to add chunks to index: {e}")
             return []
+        
+        # Phase 4: Build BM25 index (new)
+        if self.bm25_enabled:
+            try:
+                # Rebuild BM25 index with all chunks (including newly added)
+                all_texts = [m["text"] for m in self.metadata]
+                self._build_bm25_index(all_texts)
+            except Exception as e:
+                logger.warning(f"Failed to build BM25 index: {e}. BM25 search will be unavailable.")
+                self.bm25_index = None
+        
+        return chunk_ids
 
     def _is_valid_chunk(self, chunk: str) -> bool:
         """Validate chunk for SentenceTransformer processing - SIMPLIFIED"""
@@ -313,16 +380,16 @@ class IndexManager:
 
         return chunk_ids
     
-    def search(self, query: str, top_k: int = 5) -> List[Tuple[int, float, Dict[str, Any]]]:
+    def _search_vector(self, query: str, top_k: int) -> List[Tuple[int, float, Dict[str, Any]]]:
         """
-        Search for similar chunks
+        Semantic search using FAISS vector index
         
         Args:
             query: Search query
-            top_k: Number of results to return
+            top_k: Number of results
             
         Returns:
-            List of (chunk_id, distance, metadata) tuples
+            List of (chunk_id, score, metadata) tuples
         """
         # Generate query embedding
         query_embedding = self.embedding_model.encode([query])
@@ -331,14 +398,149 @@ class IndexManager:
         # Search
         distances, indices = self.index.search(query_embedding, top_k)
         
-        # Gather results
+        # Gather results (convert distance to similarity score)
         results = []
         for dist, idx in zip(distances[0], indices[0]):
             if idx >= 0:  # Valid result
+                # Convert L2 distance to similarity score (higher is better)
+                score = 1.0 / (1.0 + float(dist))
                 metadata = self.metadata[idx]
-                results.append((idx, float(dist), metadata))
+                results.append((int(idx), score, metadata))
         
         return results
+    
+    def _search_bm25(self, query: str, top_k: int) -> List[Tuple[int, float, Dict[str, Any]]]:
+        """
+        Keyword search using BM25
+        
+        Args:
+            query: Search query
+            top_k: Number of results
+            
+        Returns:
+            List of (chunk_id, score, metadata) tuples
+        """
+        if not self.bm25_index:
+            logger.warning("BM25 index not available. Falling back to vector search.")
+            return self._search_vector(query, top_k)
+        
+        # Tokenize query
+        tokenized_query = self._tokenize(query)
+        
+        # Get BM25 scores for all documents
+        scores = self.bm25_index.get_scores(tokenized_query)
+        
+        # Get top-k indices
+        top_indices = np.argsort(scores)[-top_k:][::-1]
+        
+        # Gather results
+        results = []
+        for idx in top_indices:
+            if scores[idx] > 0:  # Only include results with positive scores
+                metadata = self.metadata[idx]
+                results.append((int(idx), float(scores[idx]), metadata))
+        
+        return results
+    
+    def _rrf_fusion(
+        self, 
+        vector_results: List[Tuple[int, float, Dict[str, Any]]], 
+        bm25_results: List[Tuple[int, float, Dict[str, Any]]], 
+        top_k: int,
+        k: int = 60
+    ) -> List[Tuple[int, float, Dict[str, Any]]]:
+        """
+        Reciprocal Rank Fusion (RRF) to combine vector and BM25 results.
+        
+        RRF is a simple but effective fusion method that's robust to score differences
+        between retrieval methods. Formula: RRF(d) = Σ 1/(k + rank(d))
+        
+        Args:
+            vector_results: Results from vector search
+            bm25_results: Results from BM25 search
+            top_k: Number of final results to return
+            k: RRF constant (default 60, as per original paper)
+            
+        Returns:
+            Fused results sorted by RRF score
+        """
+        rrf_scores = {}
+        chunk_metadata = {}
+        
+        # Process vector results
+        for rank, (chunk_id, score, metadata) in enumerate(vector_results):
+            rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0) + 1.0 / (k + rank + 1)
+            chunk_metadata[chunk_id] = metadata
+        
+        # Process BM25 results
+        for rank, (chunk_id, score, metadata) in enumerate(bm25_results):
+            rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0) + 1.0 / (k + rank + 1)
+            chunk_metadata[chunk_id] = metadata
+        
+        # Sort by RRF score
+        sorted_chunks = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # Return top-k results
+        results = []
+        for chunk_id, rrf_score in sorted_chunks[:top_k]:
+            results.append((chunk_id, rrf_score, chunk_metadata[chunk_id]))
+        
+        return results
+    
+    def search(
+        self, 
+        query: str, 
+        top_k: int = 5,
+        mode: Literal["vector", "bm25", "hybrid"] = "vector"
+    ) -> List[Tuple[int, float, Dict[str, Any]]]:
+        """
+        Search for similar chunks using specified mode.
+        
+        Args:
+            query: Search query
+            top_k: Number of results to return
+            mode: Search mode
+                - 'vector': Semantic search using embeddings (default, original behavior)
+                - 'bm25': Keyword-based search using BM25
+                - 'hybrid': Combines vector and BM25 using RRF fusion
+            
+        Returns:
+            List of (chunk_id, score, metadata) tuples
+            
+        Example:
+            # Original behavior (backward compatible)
+            results = index_manager.search("machine learning", top_k=5)
+            
+            # Exact keyword matching
+            results = index_manager.search("ISO 27001", top_k=5, mode="bm25")
+            
+            # Best of both worlds
+            results = index_manager.search("security compliance", top_k=5, mode="hybrid")
+        """
+        if mode == "vector":
+            return self._search_vector(query, top_k)
+        
+        elif mode == "bm25":
+            if not self.bm25_index:
+                logger.warning("BM25 not available. Install rank-bm25 or falling back to vector search.")
+                return self._search_vector(query, top_k)
+            return self._search_bm25(query, top_k)
+        
+        elif mode == "hybrid":
+            if not self.bm25_index:
+                logger.warning("BM25 not available for hybrid search. Using vector search only.")
+                return self._search_vector(query, top_k)
+            
+            # Get results from both methods (fetch more for better fusion)
+            fetch_k = min(top_k * 3, len(self.metadata))
+            vector_results = self._search_vector(query, fetch_k)
+            bm25_results = self._search_bm25(query, fetch_k)
+            
+            # Fuse results
+            return self._rrf_fusion(vector_results, bm25_results, top_k)
+        
+        else:
+            raise ValueError(f"Unknown search mode: {mode}. Use 'vector', 'bm25', or 'hybrid'.")
     
     def get_chunks_by_frame(self, frame_number: int) -> List[Dict[str, Any]]:
         """Get all chunks associated with a frame"""
@@ -368,11 +570,19 @@ class IndexManager:
             "metadata": self.metadata,
             "chunk_to_frame": self.chunk_to_frame,
             "frame_to_chunks": self.frame_to_chunks,
-            "config": self.config
+            "config": self.config,
+            "bm25_enabled": self.bm25_enabled and self.bm25_index is not None
         }
         
         with open(path.with_suffix('.json'), 'w') as f:
             json.dump(data, f, indent=2)
+        
+        # Save BM25 data separately (tokenized corpus for rebuilding)
+        if self.bm25_index and self.tokenized_corpus:
+            bm25_path = path.with_suffix('.bm25.pkl')
+            with open(bm25_path, 'wb') as f:
+                pickle.dump(self.tokenized_corpus, f)
+            logger.info(f"Saved BM25 data to {bm25_path}")
         
         logger.info(f"Saved index to {path}")
     
@@ -400,6 +610,23 @@ class IndexManager:
         if "config" in data:
             self.config.update(data["config"])
         
+        # Load BM25 data if available
+        bm25_path = path.with_suffix('.bm25.pkl')
+        if bm25_path.exists() and BM25_AVAILABLE:
+            try:
+                with open(bm25_path, 'rb') as f:
+                    self.tokenized_corpus = pickle.load(f)
+                self.bm25_index = BM25Okapi(self.tokenized_corpus)
+                logger.info(f"Loaded BM25 index from {bm25_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load BM25 index: {e}")
+                self.bm25_index = None
+        elif data.get("bm25_enabled") and self.metadata:
+            # Rebuild BM25 from metadata if pkl not found
+            logger.info("Rebuilding BM25 index from metadata...")
+            all_texts = [m["text"] for m in self.metadata]
+            self._build_bm25_index(all_texts)
+        
         logger.info(f"Loaded index from {path}")
     
     def get_stats(self) -> Dict[str, Any]:
@@ -410,5 +637,14 @@ class IndexManager:
             "index_type": self.config["index"]["type"],
             "embedding_model": self.config["embedding"]["model"],
             "dimension": self.dimension,
-            "avg_chunks_per_frame": np.mean([len(chunks) for chunks in self.frame_to_chunks.values()]) if self.frame_to_chunks else 0
+            "avg_chunks_per_frame": np.mean([len(chunks) for chunks in self.frame_to_chunks.values()]) if self.frame_to_chunks else 0,
+            "bm25_enabled": self.bm25_index is not None,
+            "search_modes_available": self._get_available_search_modes()
         }
+    
+    def _get_available_search_modes(self) -> List[str]:
+        """Get list of available search modes"""
+        modes = ["vector"]  # Always available
+        if self.bm25_index:
+            modes.extend(["bm25", "hybrid"])
+        return modes
